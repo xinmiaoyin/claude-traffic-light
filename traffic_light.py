@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
-Claude Code Traffic Light - System Tray Indicator
+Claude Code Traffic Light - System Tray Indicator (Multi-Session)
 
-Shows a traffic light icon in the system tray that reflects Claude Code's state:
-  🟢 Green  - Working / idle
-  🟡 Yellow - Needs user attention (permission prompt)
-  🔴 Red    - Stopped / error
+Shows a traffic light icon in the system tray that aggregates Claude Code's
+state across ALL running sessions:
 
-The tray app polls a status file (~/.claude/traffic_light_status) every 500ms.
-Use set_status.py to update the status from Claude Code hooks.
+  🟢 Green  - All sessions working / idle
+  🟡 Yellow - At least one session needs attention (yellow wins)
+  🔴 Red    - All sessions stopped (or no sessions detected)
+
+Uses per-session status files written by set_status.py.
+  Status files: ~/.claude/traffic_light_sessions/<session_id>.json
+  TTL cleanup: sessions not updated in 5 minutes are removed.
 """
 
 import json
@@ -18,7 +21,7 @@ import time
 import threading
 import atexit
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from PIL import Image, ImageDraw
@@ -28,26 +31,23 @@ import pystray
 # --- Configuration ---
 HOME = Path.home()
 CLAUDE_DIR = HOME / ".claude"
-STATUS_FILE = CLAUDE_DIR / "traffic_light_status"
+SESSIONS_DIR = CLAUDE_DIR / "traffic_light_sessions"
+LEGACY_STATUS_FILE = CLAUDE_DIR / "traffic_light_status"
 PID_FILE = CLAUDE_DIR / "traffic_light.pid"
 LOG_FILE = CLAUDE_DIR / "traffic_light.log"
 POLL_INTERVAL = 0.5  # seconds
-ICON_SIZE = 64  # pixels (will be scaled by system tray)
+ICON_SIZE = 64  # pixels
+SESSION_TTL = timedelta(minutes=5)
 
 # Colors
 GREEN = (0, 200, 50)
 YELLOW = (255, 200, 0)
 RED = (220, 40, 40)
-DIM_YELLOW = (180, 140, 50)  # For blink-off phase
+DIM_YELLOW = (180, 140, 50)
 GRAY = (100, 100, 100)
 
-# Tooltip texts
-TOOLTIPS = {
-    "green": "Claude Code: Working",
-    "yellow": "Claude Code: Needs Attention!",
-    "red": "Claude Code: Stopped",
-    "unknown": "Claude Code: Unknown",
-}
+# Status priority for aggregation (higher index = higher priority)
+STATUS_PRIORITY = {"red": 0, "green": 1, "yellow": 2}
 
 
 def startup_log(msg):
@@ -69,32 +69,120 @@ def draw_traffic_light(color, size=ICON_SIZE):
     draw = ImageDraw.Draw(image)
 
     margin = 4
-    # Outer ring (dark border)
     draw.ellipse([margin, margin, size - margin, size - margin],
                  outline=(60, 60, 60), width=3)
-    # Inner filled circle
     draw.ellipse([margin + 3, margin + 3, size - margin - 3, size - margin - 3],
                  fill=color)
-    # Highlight (gloss effect)
     highlight_margin = size // 3
     draw.ellipse(
         [highlight_margin, size // 6, size - highlight_margin, size // 2],
         fill=(255, 255, 255, 60)
     )
-
     return image
 
 
-def read_status():
-    """Read status from the status file. Returns 'unknown' if file missing/corrupt."""
+def read_all_sessions():
+    """
+    Read all per-session status files.
+    Returns (aggregated_status, session_details).
+
+    aggregated_status: one of 'green', 'yellow', 'red', 'unknown'
+    session_details: list of dicts with {session_id, status, updated_at}
+    """
+    sessions = []
+    now = datetime.now(timezone.utc)
+
+    if SESSIONS_DIR.exists():
+        for f in sorted(SESSIONS_DIR.glob("*.json")):
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+                sid = data.get("session_id", f.stem)
+                status = data.get("status", "unknown")
+                updated_str = data.get("updated_at", "")
+
+                # Parse timestamp
+                try:
+                    updated = datetime.fromisoformat(updated_str)
+                except (ValueError, TypeError):
+                    updated = now
+
+                # Skip stale sessions
+                if now - updated > SESSION_TTL:
+                    # Clean up stale file
+                    f.unlink(missing_ok=True)
+                    startup_log(f"Cleaned stale session: {sid}")
+                    continue
+
+                if status in ("green", "yellow", "red"):
+                    sessions.append({
+                        "session_id": sid,
+                        "status": status,
+                        "updated_at": updated,
+                    })
+            except (json.JSONDecodeError, OSError):
+                # Corrupt file, clean it up
+                f.unlink(missing_ok=True)
+
+    # Aggregate: pick the highest-priority status
+    if not sessions:
+        # Fall back to legacy single-file for backward compat
+        legacy = _read_legacy_status()
+        if legacy != "unknown":
+            return legacy, []
+        return "unknown", []
+
+    # Priority aggregation: yellow wins over everything, then green, then red
+    aggregated = "unknown"
+    for s in sessions:
+        if STATUS_PRIORITY.get(s["status"], -1) > STATUS_PRIORITY.get(aggregated, -1):
+            aggregated = s["status"]
+
+    return aggregated, sessions
+
+
+def _read_legacy_status():
+    """Read legacy single status file (backward compat)."""
     try:
-        if STATUS_FILE.exists():
-            content = STATUS_FILE.read_text(encoding="utf-8").strip()
+        if LEGACY_STATUS_FILE.exists():
+            content = LEGACY_STATUS_FILE.read_text(encoding="utf-8").strip()
             if content in ("green", "yellow", "red"):
                 return content
     except Exception:
         pass
     return "unknown"
+
+
+def build_tooltip(aggregated, sessions):
+    """Build a descriptive tooltip from session data."""
+    base = "Claude Code Traffic Light"
+
+    if not sessions:
+        return f"{base}\nNo active sessions"
+
+    # Status line
+    status_line = {
+        "green": "🟢 All clear — no sessions need attention",
+        "yellow": "🟡 ATTENTION — a session needs your confirmation!",
+        "red": "🔴 All sessions stopped",
+        "unknown": "⚫ Status unknown",
+    }.get(aggregated, "")
+
+    # Session summary
+    counts = {}
+    for s in sessions:
+        counts[s["status"]] = counts.get(s["status"], 0) + 1
+
+    parts = []
+    if counts.get("green"):
+        parts.append(f"{counts['green']} working")
+    if counts.get("yellow"):
+        parts.append(f"{counts['yellow']} need attention")
+    if counts.get("red"):
+        parts.append(f"{counts['red']} stopped")
+
+    session_line = ", ".join(parts) if parts else ""
+
+    return f"{base}\n{status_line}\n{len(sessions)} sessions: {session_line}"
 
 
 def write_pid():
@@ -112,37 +200,29 @@ def remove_pid():
 
 
 def is_process_alive(pid):
-    """Check if a process with the given PID is running. Works on Windows and Unix."""
+    """Check if a process with the given PID is running."""
     try:
-        # Try psutil first (most reliable)
         import psutil
         return psutil.pid_exists(pid)
     except ImportError:
         pass
-
     try:
-        # Try Windows API
         import ctypes
         from ctypes import wintypes
-
         SYNCHRONIZE = 0x100000
         PROCESS_QUERY_INFORMATION = 0x0400
         STILL_ACTIVE = 259
-
         kernel32 = ctypes.windll.kernel32
         handle = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | SYNCHRONIZE, False, pid)
         if handle == 0:
             return False
-
         exit_code = wintypes.DWORD()
         kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
         kernel32.CloseHandle(handle)
         return exit_code.value == STILL_ACTIVE
     except Exception:
         pass
-
     try:
-        # Fallback: os.kill with signal 0
         os.kill(pid, 0)
         return True
     except OSError:
@@ -157,32 +237,26 @@ def is_already_running():
             if is_process_alive(pid):
                 return True
             else:
-                # Process not alive, clean up stale PID
                 startup_log(f"Cleaning up stale PID file (PID {pid} is dead)")
                 PID_FILE.unlink(missing_ok=True)
     except Exception:
-        # If PID file is corrupt, just remove it
         PID_FILE.unlink(missing_ok=True)
     return False
 
 
 def check_environment():
-    """Check that the environment can support a system tray icon. Returns (ok, message)."""
-    # Check available backends
+    """Check that the environment can support a system tray icon."""
     backends = []
-
     try:
         import tkinter
         backends.append("tkinter")
-    except ImportError as e:
+    except ImportError:
         pass
-
     try:
         import win32api
         backends.append("win32")
-    except ImportError as e:
+    except ImportError:
         pass
-
     try:
         import gi
         backends.append("gtk")
@@ -196,18 +270,19 @@ def check_environment():
             "    pip install pywin32     (recommended)\n"
             "  Or ensure tkinter is installed with Python."
         )
-
     return True, f"Backend available: {', '.join(backends)}"
 
 
 class TrafficLightApp:
-    """System tray traffic light application."""
+    """System tray traffic light application with multi-session aggregation."""
 
     def __init__(self):
         self.current_status = "unknown"
-        self.blink_state = False  # For yellow blinking
+        self.session_count = 0
+        self.blink_state = False
         self.blink_counter = 0
         self.running = True
+        self._last_session_log = ""
 
         # Pre-generate icons
         self.icons = {
@@ -221,27 +296,37 @@ class TrafficLightApp:
     def get_current_icon(self):
         """Get the appropriate icon for current state."""
         if self.current_status == "yellow":
-            # Blink every 3 poll cycles (1.5 seconds)
             return self.icons["yellow_on"] if self.blink_state else self.icons["yellow_off"]
         return self.icons.get(self.current_status, self.icons["unknown"])
 
     def poll_status(self, icon):
-        """Poll the status file and update tray accordingly."""
-        startup_log("Polling thread started")
+        """Poll all session files and update tray accordingly."""
+        startup_log("Polling thread started (multi-session mode)")
         while self.running:
             try:
-                new_status = read_status()
+                aggregated, sessions = read_all_sessions()
 
-                if new_status != self.current_status:
-                    startup_log(f"Status changed: {self.current_status} -> {new_status}")
-                    self.current_status = new_status
+                if aggregated != self.current_status or len(sessions) != self.session_count:
+                    # Only log on actual changes
+                    if aggregated != self.current_status:
+                        yellow_sessions = [s["session_id"] for s in sessions if s["status"] == "yellow"]
+                        detail = ""
+                        if yellow_sessions:
+                            detail = f" (yellow: {', '.join(yellow_sessions[:3])})"
+                        startup_log(
+                            f"Status: {self.current_status} -> {aggregated} "
+                            f"[{len(sessions)} sessions]{detail}"
+                        )
+
+                    self.current_status = aggregated
+                    self.session_count = len(sessions)
                     icon.icon = self.get_current_icon()
-                    icon.title = TOOLTIPS.get(new_status, TOOLTIPS["unknown"])
+                    icon.title = build_tooltip(aggregated, sessions)
 
                 # Handle blink for yellow
                 if self.current_status == "yellow":
                     self.blink_counter += 1
-                    if self.blink_counter >= 3:  # Toggle every ~1.5s
+                    if self.blink_counter >= 3:
                         self.blink_state = not self.blink_state
                         self.blink_counter = 0
                         icon.icon = self.get_current_icon()
@@ -262,55 +347,38 @@ class TrafficLightApp:
 
     def run(self):
         """Start the tray application."""
-        startup_log("Starting traffic light tray app...")
+        startup_log("Starting traffic light tray app (multi-session mode)...")
 
-        # Create the tray icon
+        # Ensure sessions directory exists
+        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+
         icon = pystray.Icon(
             name="claude-traffic-light",
-            title=TOOLTIPS["unknown"],
+            title="Claude Code Traffic Light",
             icon=self.icons["unknown"],
             menu=pystray.Menu(
                 pystray.MenuItem("🚦 Claude Code Traffic Light", None, enabled=False),
                 pystray.Menu.SEPARATOR,
-                pystray.MenuItem("Status: Green", self._set_green),
-                pystray.MenuItem("Status: Yellow", self._set_yellow),
-                pystray.MenuItem("Status: Red", self._set_red),
+                pystray.MenuItem(
+                    lambda text: f"Sessions: {self.session_count}",
+                    None,
+                    enabled=False
+                ),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("Exit", self.on_stop),
             ),
         )
 
-        # Start polling thread
         poll_thread = threading.Thread(target=self.poll_status, args=(icon,), daemon=True)
         poll_thread.start()
 
         startup_log("Tray icon created, entering main loop...")
-        # Run the tray icon (blocking)
         icon.run()
         startup_log("Tray icon main loop exited")
-
-    def _set_green(self, icon, item):
-        """Manually set status to green."""
-        STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        STATUS_FILE.write_text("green")
-        startup_log("Manually set to GREEN")
-
-    def _set_yellow(self, icon, item):
-        """Manually set status to yellow."""
-        STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        STATUS_FILE.write_text("yellow")
-        startup_log("Manually set to YELLOW")
-
-    def _set_red(self, icon, item):
-        """Manually set status to red."""
-        STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        STATUS_FILE.write_text("red")
-        startup_log("Manually set to RED")
 
 
 def main():
     """Entry point."""
-    # Parse command line
     if len(sys.argv) > 1:
         cmd = sys.argv[1]
         if cmd == "--kill":
@@ -328,18 +396,20 @@ def main():
         elif cmd == "--force":
             remove_pid()
             startup_log("Force-starting (PID file cleared)")
+        elif cmd in ("--help", "-h"):
+            print(__doc__)
+            print("Usage: python traffic_light.py [--kill|--check|--force]")
+            return
         else:
             print(f"Unknown option: {cmd}", file=sys.stderr)
             print(f"Usage: python {sys.argv[0]} [--kill|--check|--force]")
             return
 
-    # Prevent duplicate instances
     if is_already_running():
         print("Traffic light is already running.", file=sys.stderr)
         print(f"  Use 'python {sys.argv[0]} --force' to force restart.", file=sys.stderr)
         return
 
-    # Check environment
     ok, msg = check_environment()
     if not ok:
         print(f"ERROR: {msg}", file=sys.stderr)
@@ -348,14 +418,10 @@ def main():
 
     startup_log(f"Environment OK: {msg}")
 
-    # Ensure status directory exists
-    STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
-
-    # Write PID
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     write_pid()
     atexit.register(remove_pid)
 
-    # Start the app
     app = TrafficLightApp()
     try:
         app.run()

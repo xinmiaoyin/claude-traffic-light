@@ -17,6 +17,8 @@ import sys
 import time
 import threading
 import atexit
+import traceback
+from datetime import datetime
 from pathlib import Path
 
 from PIL import Image, ImageDraw
@@ -24,8 +26,11 @@ import pystray
 
 
 # --- Configuration ---
-STATUS_FILE = Path.home() / ".claude" / "traffic_light_status"
-PID_FILE = Path.home() / ".claude" / "traffic_light.pid"
+HOME = Path.home()
+CLAUDE_DIR = HOME / ".claude"
+STATUS_FILE = CLAUDE_DIR / "traffic_light_status"
+PID_FILE = CLAUDE_DIR / "traffic_light.pid"
+LOG_FILE = CLAUDE_DIR / "traffic_light.log"
 POLL_INTERVAL = 0.5  # seconds
 ICON_SIZE = 64  # pixels (will be scaled by system tray)
 
@@ -43,6 +48,19 @@ TOOLTIPS = {
     "red": "Claude Code: Stopped",
     "unknown": "Claude Code: Unknown",
 }
+
+
+def startup_log(msg):
+    """Log a message to the log file and print to stderr."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{timestamp}] {msg}"
+    try:
+        CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+    print(line, file=sys.stderr)
 
 
 def draw_traffic_light(color, size=ICON_SIZE):
@@ -93,21 +111,93 @@ def remove_pid():
         pass
 
 
+def is_process_alive(pid):
+    """Check if a process with the given PID is running. Works on Windows and Unix."""
+    try:
+        # Try psutil first (most reliable)
+        import psutil
+        return psutil.pid_exists(pid)
+    except ImportError:
+        pass
+
+    try:
+        # Try Windows API
+        import ctypes
+        from ctypes import wintypes
+
+        SYNCHRONIZE = 0x100000
+        PROCESS_QUERY_INFORMATION = 0x0400
+        STILL_ACTIVE = 259
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | SYNCHRONIZE, False, pid)
+        if handle == 0:
+            return False
+
+        exit_code = wintypes.DWORD()
+        kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+        kernel32.CloseHandle(handle)
+        return exit_code.value == STILL_ACTIVE
+    except Exception:
+        pass
+
+    try:
+        # Fallback: os.kill with signal 0
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
 def is_already_running():
     """Check if another instance is already running."""
     try:
         if PID_FILE.exists():
             pid = int(PID_FILE.read_text().strip())
-            # Check if process is still alive
-            try:
-                os.kill(pid, 0)  # Signal 0 = just check existence
+            if is_process_alive(pid):
                 return True
-            except OSError:
+            else:
                 # Process not alive, clean up stale PID
+                startup_log(f"Cleaning up stale PID file (PID {pid} is dead)")
                 PID_FILE.unlink(missing_ok=True)
     except Exception:
-        pass
+        # If PID file is corrupt, just remove it
+        PID_FILE.unlink(missing_ok=True)
     return False
+
+
+def check_environment():
+    """Check that the environment can support a system tray icon. Returns (ok, message)."""
+    # Check available backends
+    backends = []
+
+    try:
+        import tkinter
+        backends.append("tkinter")
+    except ImportError as e:
+        pass
+
+    try:
+        import win32api
+        backends.append("win32")
+    except ImportError as e:
+        pass
+
+    try:
+        import gi
+        backends.append("gtk")
+    except ImportError:
+        pass
+
+    if not backends:
+        return False, (
+            "No GUI backend available!\n"
+            "  On Windows, install one of:\n"
+            "    pip install pywin32     (recommended)\n"
+            "  Or ensure tkinter is installed with Python."
+        )
+
+    return True, f"Backend available: {', '.join(backends)}"
 
 
 class TrafficLightApp:
@@ -135,47 +225,56 @@ class TrafficLightApp:
             return self.icons["yellow_on"] if self.blink_state else self.icons["yellow_off"]
         return self.icons.get(self.current_status, self.icons["unknown"])
 
-    def update_tray(self, icon):
-        """Called by pystray to update the icon."""
-        icon.icon = self.get_current_icon()
-
     def poll_status(self, icon):
         """Poll the status file and update tray accordingly."""
+        startup_log("Polling thread started")
         while self.running:
-            new_status = read_status()
+            try:
+                new_status = read_status()
 
-            if new_status != self.current_status:
-                self.current_status = new_status
-                icon.icon = self.get_current_icon()
-                icon.title = TOOLTIPS.get(new_status, TOOLTIPS["unknown"])
-
-            # Handle blink for yellow
-            if self.current_status == "yellow":
-                self.blink_counter += 1
-                if self.blink_counter >= 3:  # Toggle every ~1.5s
-                    self.blink_state = not self.blink_state
-                    self.blink_counter = 0
+                if new_status != self.current_status:
+                    startup_log(f"Status changed: {self.current_status} -> {new_status}")
+                    self.current_status = new_status
                     icon.icon = self.get_current_icon()
-            else:
-                self.blink_state = False
-                self.blink_counter = 0
+                    icon.title = TOOLTIPS.get(new_status, TOOLTIPS["unknown"])
+
+                # Handle blink for yellow
+                if self.current_status == "yellow":
+                    self.blink_counter += 1
+                    if self.blink_counter >= 3:  # Toggle every ~1.5s
+                        self.blink_state = not self.blink_state
+                        self.blink_counter = 0
+                        icon.icon = self.get_current_icon()
+                else:
+                    self.blink_state = False
+                    self.blink_counter = 0
+
+            except Exception as e:
+                startup_log(f"Poll error: {e}")
 
             time.sleep(POLL_INTERVAL)
 
     def on_stop(self, icon):
         """Handle tray exit."""
+        startup_log("User requested exit")
         self.running = False
         icon.stop()
 
     def run(self):
         """Start the tray application."""
+        startup_log("Starting traffic light tray app...")
+
         # Create the tray icon
         icon = pystray.Icon(
             name="claude-traffic-light",
             title=TOOLTIPS["unknown"],
             icon=self.icons["unknown"],
             menu=pystray.Menu(
-                pystray.MenuItem("Claude Code Traffic Light", None, enabled=False),
+                pystray.MenuItem("🚦 Claude Code Traffic Light", None, enabled=False),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("Status: Green", self._set_green),
+                pystray.MenuItem("Status: Yellow", self._set_yellow),
+                pystray.MenuItem("Status: Red", self._set_red),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("Exit", self.on_stop),
             ),
@@ -185,24 +284,69 @@ class TrafficLightApp:
         poll_thread = threading.Thread(target=self.poll_status, args=(icon,), daemon=True)
         poll_thread.start()
 
+        startup_log("Tray icon created, entering main loop...")
         # Run the tray icon (blocking)
         icon.run()
+        startup_log("Tray icon main loop exited")
+
+    def _set_green(self, icon, item):
+        """Manually set status to green."""
+        STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        STATUS_FILE.write_text("green")
+        startup_log("Manually set to GREEN")
+
+    def _set_yellow(self, icon, item):
+        """Manually set status to yellow."""
+        STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        STATUS_FILE.write_text("yellow")
+        startup_log("Manually set to YELLOW")
+
+    def _set_red(self, icon, item):
+        """Manually set status to red."""
+        STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        STATUS_FILE.write_text("red")
+        startup_log("Manually set to RED")
 
 
 def main():
     """Entry point."""
     # Parse command line
-    if len(sys.argv) > 1 and sys.argv[1] == "--kill":
-        remove_pid()
-        print("Traffic light PID file removed.")
-        return
+    if len(sys.argv) > 1:
+        cmd = sys.argv[1]
+        if cmd == "--kill":
+            remove_pid()
+            print("PID file removed.")
+            return
+        elif cmd == "--check":
+            ok, msg = check_environment()
+            print(msg)
+            if ok:
+                print("Environment looks good!")
+            else:
+                print("Environment issues found.")
+            return
+        elif cmd == "--force":
+            remove_pid()
+            startup_log("Force-starting (PID file cleared)")
+        else:
+            print(f"Unknown option: {cmd}", file=sys.stderr)
+            print(f"Usage: python {sys.argv[0]} [--kill|--check|--force]")
+            return
 
     # Prevent duplicate instances
     if is_already_running():
-        print("Traffic light is already running. Exiting.")
-        print(f"  (PID file: {PID_FILE})")
-        print(f"  Run '{os.path.basename(sys.argv[0])} --kill' to force cleanup.")
+        print("Traffic light is already running.", file=sys.stderr)
+        print(f"  Use 'python {sys.argv[0]} --force' to force restart.", file=sys.stderr)
         return
+
+    # Check environment
+    ok, msg = check_environment()
+    if not ok:
+        print(f"ERROR: {msg}", file=sys.stderr)
+        startup_log(f"Environment check failed: {msg}")
+        sys.exit(1)
+
+    startup_log(f"Environment OK: {msg}")
 
     # Ensure status directory exists
     STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -216,9 +360,14 @@ def main():
     try:
         app.run()
     except KeyboardInterrupt:
-        pass
+        startup_log("Interrupted by Ctrl+C")
+    except Exception as e:
+        startup_log(f"Fatal error: {e}\n{traceback.format_exc()}")
+        print(f"ERROR: {e}", file=sys.stderr)
+        print(f"Check {LOG_FILE} for details.", file=sys.stderr)
     finally:
         remove_pid()
+        startup_log("Traffic light stopped")
 
 
 if __name__ == "__main__":
